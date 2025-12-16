@@ -1,5 +1,12 @@
+jupyterlab==4.2.5
 matplotlib==3.7.1
-numpy==1.24.3
-pandas==2.0.1
+pandas==2.2.2
+numpy==1.26.4
+seaborn==0.12.2
+statsmodels==0.13.5
 scikit-learn==1.2.2
-statsmodels==0.14.0
+pydot
+protobuf
+tensorflow==2.15
+tensorflow-hub
+tensorflow-docs
