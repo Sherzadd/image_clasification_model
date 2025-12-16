@@ -30,7 +30,15 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements_dev.txt
 ```
-
+# windo
+```powershell 
+pyenv local 3.11.3
+python -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements_dev.txt
+```
 The `requirements.txt` file contains the libraries needed for deployment.. of model or dashboard .. thus no jupyter or other libs used during development.
 
 The MLFLOW URI should **not be stored on git**, you have two options, to save it locally in the `.mlflow_uri` file:
