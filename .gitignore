@@ -136,3 +136,12 @@ models/*
 
 #config file has sensitive data
 .mlflow_uri
+
+# Data (never commit raw images)
+data/raw/
+PlantVillage/
+
+# Large files
+*.zip
+*.tar
+*.gz
