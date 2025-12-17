@@ -1,3 +1,8 @@
+# About the project
+
+# Validation
+Train, validation, and test splits are created via index-based sampling with a fixed random seed, making the splits fully reproducible across machines without version-controlling the raw image data.
+
 # ds-modeling-pipeline
 
 Here you find a Skeleton project for building a simple model in a python script or notebook and log the results on MLFlow.
@@ -22,16 +27,25 @@ Use the requirements file in this repo to create a new environment.
 ```BASH
 make setup
 
-#or
 
-pyenv local 3.11.3
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements_dev.txt
-```
+    ```PowerShell
+    pyenv local 3.11.3
+    python -m venv .venv
+    .venv\Scripts\Activate.ps1
+    python -m pip install --upgrade pip
+    pip install -r requirements_capstone.txt
+    ```
 
-The `requirements.txt` file contains the libraries needed for deployment.. of model or dashboard .. thus no jupyter or other libs used during development.
+    For `Git-bash` CLI :
+  
+    ```BASH
+    pyenv local 3.11.3
+    python -m venv .venv
+    source .venv/Scripts/activate
+    python -m pip install --upgrade pip
+    pip install -r requirements_capstone.txt
+    ```
+The `requirements_capstone.txt` file contains the libraries needed for deployment.. of model or dashboard .. thus no jupyter or other libs used during development.
 
 The MLFLOW URI should **not be stored on git**, you have two options, to save it locally in the `.mlflow_uri` file:
 
