@@ -17,3 +17,6 @@ tqdm
 
 # Jupyter kernel support
 ipykernel
+
+# Web app framework
+streamlit pillow
