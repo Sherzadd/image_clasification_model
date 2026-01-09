@@ -1,25 +1,29 @@
 # app.py
-# ✅ User-friendly UI (no technical settings)
-# ✅ Sidebar shows a User Manual instead of model settings
-# ✅ Class names auto-loaded from MODEL (embedded ClassNamesLayer)
-# ✅ Reloads automatically when model file is updated (mtime cache key)
-# ✅ Robust loading with patched Conv2D + safe_mode=False fallback
-# ✅ Clean prediction output + Top-5 table
+# ✅ No user settings shown
+# ✅ Sidebar = User Manual only
+# ✅ Uses camera button ("Take a photo") + optional upload
+# ✅ Auto-predict immediately after photo/upload (no Predict button)
+# ✅ Loads class names from embedded ClassNamesLayer inside the model
+# ✅ Robust model loading (safe_mode fallback + patched Conv2D)
+# ✅ Caches model and reloads automatically when model file changes
 
 from pathlib import Path
 from typing import List, Optional
+import hashlib
+import io
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
 import tensorflow as tf
 
 
 # -----------------------------
-# Fixed model path (hidden from users)
+# Paths
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_REL_PATH = "models/image_classification_model_with_names.keras"
+MODEL_PATH_TEXT = DEFAULT_MODEL_REL_PATH
 
 
 def resolve_path(text: str) -> Path:
@@ -31,7 +35,6 @@ def resolve_path(text: str) -> Path:
 
 # -----------------------------
 # Embedded class names layer
-# (must exist in app to load model)
 # -----------------------------
 @tf.keras.utils.register_keras_serializable(package="meta")
 class ClassNamesLayer(tf.keras.layers.Layer):
@@ -39,10 +42,11 @@ class ClassNamesLayer(tf.keras.layers.Layer):
     Metadata-only layer:
     - stores class_names inside the saved .keras model
     - identity forward pass (does not change inputs)
-    - robust to Keras deserialization (trainable conflicts avoided)
+    - robust to deserialization
     """
     def __init__(self, class_names=None, **kwargs):
-        kwargs.pop("trainable", None)   # avoid trainable passed twice
+        # Avoid "trainable passed twice" issues
+        kwargs.pop("trainable", None)
         super().__init__(**kwargs)
         self.class_names = list(class_names) if class_names is not None else []
         self.trainable = False
@@ -81,9 +85,6 @@ def _load_model_call(
 
 @st.cache_resource
 def load_model(model_path_text: str, model_mtime: float):
-    """
-    model_mtime is included so Streamlit cache invalidates when you overwrite the file.
-    """
     model_path = resolve_path(model_path_text)
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found at: {model_path}")
@@ -91,6 +92,7 @@ def load_model(model_path_text: str, model_mtime: float):
     @tf.keras.utils.register_keras_serializable(package="Patched")
     class PatchedConv2D(tf.keras.layers.Conv2D):
         def __init__(self, *args, batch_input_shape=None, **kwargs):
+            # Ignore legacy batch_input_shape if present
             super().__init__(*args, **kwargs)
 
     custom = {
@@ -101,41 +103,17 @@ def load_model(model_path_text: str, model_mtime: float):
         "meta.ClassNamesLayer": ClassNamesLayer,
     }
 
-    attempts = [
-        dict(safe_mode=None, custom_objects=custom),
-        dict(safe_mode=False, custom_objects=custom),
-        dict(safe_mode=None, custom_objects=None),
-        dict(safe_mode=False, custom_objects=None),
-    ]
-
-    last_err = None
-    for a in attempts:
-        try:
-            return _load_model_call(
-                model_path,
-                compile=False,
-                safe_mode=a["safe_mode"],
-                custom_objects=a["custom_objects"],
-            )
-        except Exception as e:
-            last_err = e
-
-    raise last_err
+    # Try normal first, then safe_mode=False + custom
+    try:
+        return _load_model_call(model_path, compile=False, safe_mode=None, custom_objects=None)
+    except Exception:
+        return _load_model_call(model_path, compile=False, safe_mode=False, custom_objects=custom)
 
 
-# -----------------------------
-# Read class names from model
-# -----------------------------
 def get_class_names_from_model(model) -> List[str]:
     def walk(layer) -> Optional[List[str]]:
-        if hasattr(layer, "class_names"):
-            try:
-                names = list(layer.class_names)
-                if names:
-                    return names
-            except Exception:
-                pass
-
+        if isinstance(layer, ClassNamesLayer):
+            return list(layer.class_names)
         if hasattr(layer, "layers"):
             for sub in layer.layers:
                 got = walk(sub)
@@ -160,9 +138,8 @@ def model_input_size(model) -> int:
 
 
 def preprocess_image_0_255(pil_img: Image.Image, size: int) -> np.ndarray:
-    pil_img = ImageOps.exif_transpose(pil_img)  # fixes rotated phone photos
     img = pil_img.convert("RGB").resize((size, size))
-    arr = np.array(img).astype("float32")      # 0..255
+    arr = np.array(img).astype("float32")
     return np.expand_dims(arr, axis=0)
 
 
@@ -180,143 +157,116 @@ def to_probs(x: np.ndarray) -> np.ndarray:
     return ex / np.sum(ex)
 
 
-def format_percent(p: float) -> str:
-    return f"{p * 100:.2f}%"
+def sha1_bytes(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
 
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="Plant Disease Classifier", page_icon="🌿", layout="wide")
-
 st.title("🌿 Plant Disease Classifier")
-st.caption("Upload a clear leaf photo and get the predicted plant disease class from your trained model.")
+st.caption("Take a photo (recommended) or upload a leaf image — prediction runs automatically.")
 
-# ---- Sidebar: User Manual (instead of settings)
+# Sidebar = User Manual only
 st.sidebar.title("📘 User Manual")
-
 st.sidebar.markdown(
     """
 **How to take a good photo (important):**
-- Use **bright natural light** (avoid very dark photos).
+- Use bright natural light (avoid very dark photos).
 - Keep the leaf **in focus** (no blur).
 - Capture **one leaf clearly** (fill most of the frame).
 - Use a **plain background** if possible.
-- Avoid **strong shadows**, reflections, and filters.
+- Avoid strong shadows, reflections, and filters.
 - Don’t crop too tightly — include the full infected area.
 
 **How to use the app:**
-1) Upload a leaf image  
-2) Click **Predict**  
-3) Read the prediction + Top-5 results
-
-**Supported files:** PNG, JPG/JPEG, WEBP
+1. Click **Take a photo** OR upload an image  
+2. Wait ~1 second → prediction appears automatically
 """
 )
 
-with st.sidebar.expander("Troubleshooting"):
-    st.markdown(
-        """
-- If you see **class_0 / class_1** instead of real names, you are probably using a model
-  that does not include embedded class names. Use the `*_with_names.keras` file.
-- If prediction confidence looks wrong, verify your training preprocessing:
-  - If your model contains `Rescaling(1./255)` inside, this app is correct (sends 0..255).
-  - If your model expects already-scaled 0..1 input, you must add scaling here.
-"""
-    )
-
-st.sidebar.caption("Tip: Use photos similar to your training data for best accuracy.")
-
-# ---- Hidden model path (no user input)
-MODEL_PATH_TEXT = DEFAULT_MODEL_REL_PATH
+# Load model silently (no “Model ready” message)
 model_path = resolve_path(MODEL_PATH_TEXT)
-
 if not model_path.exists():
-    st.error("❌ Model file not found.")
-    st.write("Expected path:", str(model_path))
-    st.info("Make sure your model is saved inside your project folder under /models.")
+    st.error("Model file is missing in the deployed app. Please add it to the repository.")
     st.stop()
 
 mtime = model_path.stat().st_mtime
 
-# Load model
 try:
-    with st.spinner("Loading model..."):
-        model = load_model(MODEL_PATH_TEXT, mtime)
+    model = load_model(MODEL_PATH_TEXT, mtime)
 except Exception as e:
     st.error("❌ Model found, but failed to load.")
     st.exception(e)
     st.stop()
 
-# Class names from model
 class_names = get_class_names_from_model(model)
 out_dim = None
 try:
     out_dim = int(model.output_shape[-1])
 except Exception:
-    out_dim = None
+    pass
 
 if not class_names:
-    # Still works, but user-friendly warning
     class_names = [f"class_{i}" for i in range(out_dim or 0)]
-    st.warning("⚠️ This model does not contain embedded class names. Showing class_0, class_1, ...")
-else:
-    st.success(f"✅ Model ready — {len(class_names)} classes loaded.")
 
-# ---- Main: Predict
-left, right = st.columns([1, 1], gap="large")
+# Main inputs
+col1, col2 = st.columns([1, 1], gap="large")
 
-with left:
-    st.subheader("1) Upload a leaf image")
-    uploaded = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg", "webp"], label_visibility="collapsed")
+with col1:
+    st.subheader("📷 Capture or upload")
+    cam = st.camera_input("Take a photo")
+    up = st.file_uploader("Or upload an image", type=["png", "jpg", "jpeg", "webp"])
 
-    if uploaded:
-        pil = Image.open(uploaded)
-        st.image(pil, caption="Uploaded image", use_container_width=True)
+    file_obj = cam if cam is not None else up
 
-with right:
-    st.subheader("2) Predict")
-    st.write("When you are ready, click **Predict** to run the model.")
+with col2:
+    st.subheader("✅ Results")
 
-    if uploaded:
+    if file_obj is None:
+        st.info("No image yet. Use **Take a photo** or upload an image.")
+        st.stop()
+
+    img_bytes = file_obj.getvalue()
+    img_hash = sha1_bytes(img_bytes)
+
+    # Show image
+    pil = Image.open(io.BytesIO(img_bytes))
+    st.image(pil, caption="Your image", use_container_width=True)
+
+    # Auto-predict only when image changes
+    if st.session_state.get("last_img_hash") != img_hash:
+        st.session_state["last_img_hash"] = img_hash
+
         size = model_input_size(model)
+        batch = preprocess_image_0_255(pil, size)
 
-        if st.button("Predict", type="primary", use_container_width=True):
-            with st.spinner("Predicting..."):
-                batch = preprocess_image_0_255(pil, size)
-                raw = model.predict(batch, verbose=0)
-                probs = to_probs(raw)
+        with st.spinner("Predicting..."):
+            raw = model.predict(batch, verbose=0)
+            probs = to_probs(raw)
 
-            best_idx = int(np.argmax(probs))
-            best_name = class_names[best_idx] if best_idx < len(class_names) else f"class_{best_idx}"
-            best_conf = float(probs[best_idx])
+        st.session_state["last_probs"] = probs
 
-            st.subheader("✅ Result")
-            st.metric(label="Prediction", value=best_name)
-            st.progress(min(max(best_conf, 0.0), 1.0), text=f"Confidence: {format_percent(best_conf)}")
+    probs = st.session_state.get("last_probs", None)
+    if probs is None:
+        st.warning("Prediction not available yet.")
+        st.stop()
 
-            st.subheader("Top-5 predictions")
-            top_k = min(5, len(probs))
-            top_idx = np.argsort(probs)[::-1][:top_k]
+    best_idx = int(np.argmax(probs))
+    best_name = class_names[best_idx] if best_idx < len(class_names) else f"class_{best_idx}"
+    best_conf = float(probs[best_idx]) * 100
 
-            rows = []
-            for i in top_idx:
-                name = class_names[i] if i < len(class_names) else f"class_{i}"
-                rows.append({"Class": name, "Confidence": float(probs[i])})
+    st.markdown("### Prediction")
+    st.markdown(f"**{best_name}**")
+    st.metric("Confidence", f"{best_conf:.2f}%")
 
-            # Nicely formatted table
-            st.dataframe(
-                rows,
-                use_container_width=True,
-                column_config={
-                    "Confidence": st.column_config.NumberColumn(
-                        "Confidence",
-                        format="%.4f",
-                    )
-                },
-                hide_index=True,
-            )
+    st.markdown("### Top predictions")
+    top_k = min(5, len(probs))
+    top_idx = np.argsort(probs)[::-1][:top_k]
+    rows = []
+    for i in top_idx:
+        name = class_names[i] if i < len(class_names) else f"class_{i}"
+        rows.append({"Class": name, "Probability (%)": float(probs[i]) * 100})
 
-            st.caption("Note: Confidence is the model’s probability score and may be overconfident on unfamiliar photos.")
-    else:
-        st.info("Upload an image to enable prediction.")
+    st.dataframe(rows, use_container_width=True, hide_index=True)
