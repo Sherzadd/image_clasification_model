@@ -133,6 +133,8 @@ data/*.csv
 models/*.sav
 mlruns
 models/*
+!models/*.keras
+!models/*.h5
 
 #config file has sensitive data
 .mlflow_uri
