@@ -141,6 +141,8 @@ models/*
 data/raw/
 PlantVillage/
 data/wild_test/
+data/wild_pool/
+data/splits/
 reports/
 
 # Large files
