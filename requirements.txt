@@ -19,6 +19,7 @@ tqdm
 ipykernel
 
 # Web app framework
-streamlit 
+streamlit
+tensorflow==2.15.0
 pillow
 protobuf<5
