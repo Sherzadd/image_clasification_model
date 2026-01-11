@@ -131,10 +131,13 @@ dmypy.json
 
 data/*.csv
 models/*.sav
-mlruns
+mlruns/
+# ignore everything in models...
 models/*
+# ...but keep .keras models tracked
 !models/*.keras
-!models/*.h5
+# (optional) keep placeholder tracked
+!models/.gitkeep
 
 #config file has sensitive data
 .mlflow_uri
@@ -147,3 +150,6 @@ PlantVillage/
 *.zip
 *.tar
 *.gz
+
+notebooks/.streamlit_pid
+

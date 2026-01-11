@@ -1,14 +1,12 @@
 [
   "Bacterial_spot",
   "Early_blight",
-  "healthy",
   "Late_blight",
   "Leaf_Mold",
-  "mosaic_virus",
   "Septoria_leaf_spot",
   "Spider_mites_Two_spotted_spider_mite",
   "Target_Spot",
-  "YellowLeaf__Curl_Virus"
+  "YellowLeaf__Curl_Virus",
+  "healthy",
+  "mosaic_virus"
 ]
-
-
