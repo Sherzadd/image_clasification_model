@@ -466,3 +466,4 @@ For any issues, please contact the app owner at .sherzadzabihullah@yahoo.com"""
         st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
 
     st.caption("Tip: If predictions look wrong, try a brighter/sharper photo with a plain background.")
+# -----------------------------
