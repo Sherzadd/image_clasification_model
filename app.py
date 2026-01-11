@@ -58,12 +58,12 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Try a few common locations so deployment doesn't break if you move the model into /models.
 MODEL_CANDIDATES = [
-    BASE_DIR / "image_classification_model_linux.keras",
-    BASE_DIR / "image_classification_model.keras",
-    BASE_DIR / "models" / "image_classification_model_linux.keras",
-    BASE_DIR / "models" / "image_classification_model.keras",
-    BASE_DIR.parent / "models" / "image_classification_model_linux.keras",
-    BASE_DIR.parent / "models" / "image_classification_model.keras",
+    BASE_DIR / "best_model.keras",
+    BASE_DIR / "best_model.keras",
+    BASE_DIR / "models" / "best_model.keras",
+    BASE_DIR / "models" / "best_model.keras",
+    BASE_DIR.parent / "models" / "best_model.keras",
+    BASE_DIR.parent / "models" / "best_model.keras",
 ]
 MODEL_PATH = next((p.resolve() for p in MODEL_CANDIDATES if p.exists()), MODEL_CANDIDATES[0].resolve())
 
