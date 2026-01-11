@@ -10,25 +10,6 @@ import streamlit as st
 
 
 # -----------------------------
-# ✅ Custom layer (REQUIRED to load your model)
-# The model config contains: registered_name = "meta>ClassNamesLayer"
-# -----------------------------
-@tf.keras.utils.register_keras_serializable(package="meta")
-class ClassNamesLayer(tf.keras.layers.Layer):
-    def __init__(self, class_names=None, **kwargs):
-        super().__init__(trainable=False, **kwargs)
-        self.class_names = list(class_names) if class_names is not None else []
-
-    def call(self, inputs):
-        return inputs  # pass-through layer
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"class_names": self.class_names})
-        return cfg
-
-
-# -----------------------------
 # Page setup (same look, two-panel layout)
 # -----------------------------
 st.set_page_config(
@@ -82,7 +63,7 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = (BASE_DIR / "models" / "best_model.keras").resolve()
+MODEL_PATH = (BASE_DIR / "models" / "best_model").resolve()
 CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 
 # -----------------------------
@@ -107,45 +88,13 @@ def load_class_names(path: Path) -> list[str]:
     return names
 
 
-def extract_embedded_class_names(m: tf.keras.Model) -> list[str] | None:
-    """Find ClassNamesLayer anywhere in the model (even nested) and return its class_names."""
-    def walk(layer):
-        if isinstance(layer, ClassNamesLayer) and getattr(layer, "class_names", None):
-            return layer.class_names
-        if hasattr(layer, "layers"):
-            for sub in layer.layers:
-                out = walk(sub)
-                if out:
-                    return out
-        return None
-
-    for layer in getattr(m, "layers", []):
-        out = walk(layer)
-        if out:
-            return out
-    return None
-
-
 @st.cache_resource
 def load_model_cached(model_path: str, mtime: float):
-    # ✅ IMPORTANT: provide custom_objects so Keras can deserialize ClassNamesLayer
-    custom_objects = {"ClassNamesLayer": ClassNamesLayer}
-
     # Cache the model so it doesn't reload on every Streamlit rerun
     try:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=custom_objects,
-            compile=False,
-            safe_mode=False,   # Keras 3
-        )
+        return tf.keras.models.load_model(model_path, compile=False)
     except TypeError:
-        # TensorFlow 2.15 / older Keras: safe_mode may not exist
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=custom_objects,
-            compile=False,
-        )
+        return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
 
 
 def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
@@ -258,24 +207,20 @@ classes_error = None
 if not MODEL_PATH.exists():
     model_error = "Model file not found ❗"
 
+if not CLASSES_PATH.exists():
+    classes_error = "class_names.json file not found ❗"
+
 if model_error is None:
     try:
         model = load_model_cached(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
     except Exception as e:
         model_error = f"Model found, but failed to load ❌\n\n{e}"
 
-# ✅ Prefer embedded class names from the model; fallback to class_names.json if needed
-if model is not None:
-    class_names = extract_embedded_class_names(model)
-
-if class_names is None:
-    if CLASSES_PATH.exists():
-        try:
-            class_names = load_class_names(CLASSES_PATH)
-        except Exception as e:
-            classes_error = f"class_names.json found, but failed to load ❌\n\n{e}"
-    else:
-        classes_error = "No embedded class names in model AND class_names.json not found ❗"
+if classes_error is None:
+    try:
+        class_names = load_class_names(CLASSES_PATH)
+    except Exception as e:
+        classes_error = f"class_names.json found, but failed to load ❌\n\n{e}"
 
 
 # -----------------------------
@@ -364,7 +309,7 @@ with right:
         st.rerun()
 
     # -----------------------------
-    # Reject obvious non-leaf / bad quality BEFORE prediction
+    # NEW: Reject obvious non-leaf / bad quality BEFORE prediction
     # -----------------------------
     q = image_quality_and_leafness(img)
 
@@ -396,7 +341,7 @@ with right:
         if pred_id >= len(class_names):
             st.error(
                 f"Prediction index {pred_id} is outside class_names list (length {len(class_names)}). "
-                "Fix: embedded class names (or class_names.json) must match model output order."
+                "Fix: class_names.json must match the model output order."
             )
             st.stop()
 
@@ -412,6 +357,7 @@ with right:
     pred_id = int(st.session_state["last_pred"])
     confidence = float(probs[pred_id])
 
+    # YOUR RULE:
     # show prediction only if best >= 50%
     if confidence < CONFIDENCE_THRESHOLD:
         st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
