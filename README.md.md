@@ -177,9 +177,15 @@ Streamlit Cloud automatically reads `requirements.txt`.
 - Confirm the Streamlit sidebar path matches the filename exactly
 - Check `.gitignore` rules: do not accidentally ignore `models/*.keras`
 
-### “Layer conv2d expected variables, got 0”
+### “Model found, but failed to load ❌”
+`Layer 'conv2d' expected 2 variables, but received 0 variables during loading. Expected: ['conv2d/kernel:0', 'conv2d/bias:0']`
+
 This may happen when a `.keras` file saved on Windows is loaded on Linux.
 Fix: export a Linux-friendly `.keras` model (or use the provided `*_linux.keras`) and commit it to `models/`.
+
+chatgpt has an easy and quick solutin as below; 
+![alt text](<Troubleshooting_ Conv2D layer error fix.png>)
+
 
 ---
 
