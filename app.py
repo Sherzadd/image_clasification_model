@@ -16,7 +16,6 @@ st.set_page_config(
     page_title="Plant Disease identification with AI",
     page_icon="🌿",
     layout="wide",
-    initial_sidebar_state="collapsed",
 )
 
 # -----------------------------
@@ -38,19 +37,12 @@ div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child * {
     color: #ffffff !important;
 }
 
-/* Slightly nicer expander header in the left panel */
-div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child summary {
-    background: rgba(255,255,255,0.12);
-    border-radius: 12px;
-    padding: 0.55rem 0.75rem;
-}
-
 /* --- Rename the "Browse files" button text inside the uploader --- */
 div[data-testid="stFileUploader"] button {
     font-size: 0px !important;        /* hide original "Browse files" */
 }
 div[data-testid="stFileUploader"] button::after {
-    content: "Take/Upload Photo";     /* new label */
+    content: "Upload Photo";          /* new label */
     font-size: 14px;
     font-weight: 600;
 }
@@ -63,8 +55,24 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = (BASE_DIR / "image_classification_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
+
+# Try a few common locations so deployment doesn't break if you move the model into /models.
+MODEL_CANDIDATES = [
+    BASE_DIR / "image_classification_model_linux.keras",
+    BASE_DIR / "image_classification_model.keras",
+    BASE_DIR / "models" / "image_classification_model_linux.keras",
+    BASE_DIR / "models" / "image_classification_model.keras",
+    BASE_DIR.parent / "models" / "image_classification_model_linux.keras",
+    BASE_DIR.parent / "models" / "image_classification_model.keras",
+]
+MODEL_PATH = next((p.resolve() for p in MODEL_CANDIDATES if p.exists()), MODEL_CANDIDATES[0].resolve())
+
+CLASSES_CANDIDATES = [
+    BASE_DIR / "class_names.json",
+    BASE_DIR / "models" / "class_names.json",
+    BASE_DIR.parent / "models" / "class_names.json",
+]
+CLASSES_PATH = next((p.resolve() for p in CLASSES_CANDIDATES if p.exists()), CLASSES_CANDIDATES[0].resolve())
 
 # -----------------------------
 # Your rules (thresholds)
@@ -72,15 +80,15 @@ CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 CONFIDENCE_THRESHOLD = 0.50
 
 # NEW: reject obvious non-leaf / bad quality
-LEAF_RATIO_MIN = 0.05        # how much of the image looks like vegetation-ish colors
+LEAF_RATIO_MIN = 0.12        # how much of the image looks like vegetation-ish colors
 BRIGHTNESS_MIN = 0.12        # too dark -> reject
 BLUR_VAR_MIN = 60.0          # too blurry -> reject (adjust if needed)
 
 
 # -----------------------------
-# Helper functions
+# Helper: Load class names
 # -----------------------------
-def load_class_names(path: Path) -> list[str]:
+def load_class_names(path: Path) -> list:
     with open(path, "r", encoding="utf-8") as f:
         names = json.load(f)
     if not isinstance(names, list) or not names:
@@ -88,36 +96,59 @@ def load_class_names(path: Path) -> list[str]:
     return names
 
 
+# -----------------------------
+# Optional: Custom layer placeholder (safe even if your model doesn't use it)
+# -----------------------------
+class ClassNamesLayer(tf.keras.layers.Layer):
+    """
+    If your saved model includes a custom layer that stores class names,
+    defining it here lets Streamlit Cloud load the model.
+    This layer is a passthrough at inference time.
+    """
+    def __init__(self, class_names=None, **kwargs):
+        super().__init__(**kwargs)
+        self.class_names = class_names or []
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"class_names": self.class_names})
+        return cfg
+
+    def call(self, inputs):
+        return inputs
+
+
 @st.cache_resource
 def load_model_cached(model_path: str, mtime: float):
     # Cache the model so it doesn't reload on every Streamlit rerun
     try:
-        return tf.keras.models.load_model(model_path, compile=False)
+        return tf.keras.models.load_model(
+            model_path,
+            compile=False,
+            custom_objects={"ClassNamesLayer": ClassNamesLayer},
+        )
     except TypeError:
-        return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
+        # In case this Keras build expects safe_mode
+        return tf.keras.models.load_model(
+            model_path,
+            compile=False,
+            safe_mode=False,
+            custom_objects={"ClassNamesLayer": ClassNamesLayer},
+        )
 
 
 def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
-    """Return True if the model (even nested) contains a Rescaling layer."""
-    def _has(layer) -> bool:
-        if layer.__class__.__name__.lower() == "rescaling":
+    # Detect if the model already has a rescaling layer
+    for layer in getattr(model, "layers", []):
+        name = layer.__class__.__name__.lower()
+        if "rescaling" in name:
             return True
-        if hasattr(layer, "layers"):
-            for sub in layer.layers:
-                if _has(sub):
-                    return True
-        return False
-    return _has(model)
+    return False
 
 
 def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
-    """
-    Convert PIL image -> NumPy batch (1, H, W, 3)
-    Resize to model input size.
-    Do NOT divide by 255 if model already contains Rescaling(1/255).
-    """
-    img = img.convert("RGB")
-
+    """Resize image to model input shape and normalize if needed."""
+    # Resize based on model input
     in_shape = getattr(model, "input_shape", None)  # (None, 256, 256, 3)
     if isinstance(in_shape, tuple) and len(in_shape) == 4:
         target_h, target_w = in_shape[1], in_shape[2]
@@ -150,37 +181,47 @@ def image_quality_and_leafness(img: Image.Image) -> dict:
     - blur (Laplacian variance)
     - leaf_ratio: % pixels in vegetation-ish hue range (HSV)
     """
-    arr = np.asarray(img.convert("RGB")).astype(np.float32)
-    brightness = float(arr.mean() / 255.0)
+    arr = np.asarray(img).astype("float32") / 255.0  # (H,W,3) 0..1
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return {"brightness": 0.0, "blur_var": 0.0, "leaf_ratio": 0.0}
+
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    brightness = float((0.2126 * r + 0.7152 * g + 0.0722 * b).mean())
 
     # Blur score: Laplacian variance (simple 4-neighbor Laplacian)
-    gray = arr.mean(axis=2)
-    up = np.roll(gray, -1, axis=0)
-    down = np.roll(gray, 1, axis=0)
-    left = np.roll(gray, -1, axis=1)
-    right = np.roll(gray, 1, axis=1)
-    lap = (up + down + left + right) - 4.0 * gray
+    gray = (0.2126 * r + 0.7152 * g + 0.0722 * b).astype("float32")
+    lap = (
+        -4.0 * gray
+        + np.roll(gray, 1, axis=0)
+        + np.roll(gray, -1, axis=0)
+        + np.roll(gray, 1, axis=1)
+        + np.roll(gray, -1, axis=1)
+    )
     blur_var = float(lap.var())
 
-    # Leaf ratio via HSV (vectorized)
-    rgb = arr / 255.0
-    r = rgb[..., 0]
-    g = rgb[..., 1]
-    b = rgb[..., 2]
-    maxc = np.maximum(np.maximum(r, g), b)
-    minc = np.minimum(np.minimum(r, g), b)
+    # Approx HSV to detect "vegetation-ish" hues (fast)
+    maxc = np.max(arr, axis=2)
+    minc = np.min(arr, axis=2)
     delta = maxc - minc
 
     h = np.zeros_like(maxc)
-    mask = delta > 1e-6
+    idx = delta > 1e-6
 
-    # hue calc
-    idx = mask & (maxc == r)
-    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
-    idx = mask & (maxc == g)
-    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
-    idx = mask & (maxc == b)
-    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
+    # Hue calculation
+    rc = np.zeros_like(maxc)
+    gc = np.zeros_like(maxc)
+    bc = np.zeros_like(maxc)
+    rc[idx] = (maxc[idx] - r[idx]) / delta[idx]
+    gc[idx] = (maxc[idx] - g[idx]) / delta[idx]
+    bc[idx] = (maxc[idx] - b[idx]) / delta[idx]
+
+    r_is_max = (r == maxc) & idx
+    g_is_max = (g == maxc) & idx
+    b_is_max = (b == maxc) & idx
+
+    h[r_is_max] = (bc[r_is_max] - gc[r_is_max])
+    h[g_is_max] = 2.0 + (rc[g_is_max] - bc[g_is_max])
+    h[b_is_max] = 4.0 + (gc[b_is_max] - rc[b_is_max])
     h = (h / 6.0) % 1.0  # 0..1
 
     s = np.zeros_like(maxc)
@@ -205,52 +246,67 @@ model_error = None
 classes_error = None
 
 if not MODEL_PATH.exists():
-    model_error = "Model file not found ❗"
+    model_error = f"Model file not found ❗ ({MODEL_PATH})"
 
 if not CLASSES_PATH.exists():
-    classes_error = "class_names.json file not found ❗"
+    classes_error = f"class_names.json not found ❗ ({CLASSES_PATH})"
 
 if model_error is None:
     try:
+        # Use mtime so cache invalidates if you update the model file
         model = load_model_cached(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
     except Exception as e:
-        model_error = f"Model found, but failed to load ❌\n\n{e}"
+        model_error = str(e)
 
 if classes_error is None:
     try:
         class_names = load_class_names(CLASSES_PATH)
     except Exception as e:
-        classes_error = f"class_names.json found, but failed to load ❌\n\n{e}"
+        classes_error = str(e)
 
 
 # -----------------------------
-# TWO "PAGES" (LEFT / RIGHT)
+# Session state (avoid re-predicting on same image)
 # -----------------------------
-left, right = st.columns([1, 3], gap="large")
+if "last_hash" not in st.session_state:
+    st.session_state["last_hash"] = None
+    st.session_state["last_pred"] = None
+    st.session_state["last_probs"] = None
+    st.session_state["last_is_confident"] = None
 
 
 # -----------------------------
-# LEFT: User Manual (collapsible)
+# Layout: left manual + right app
+# -----------------------------
+left, right = st.columns([1, 4], gap="large")
+
+# -----------------------------
+# LEFT: User Manual
 # -----------------------------
 with left:
-    with st.expander("📘 User Manual", expanded=False):
-        st.markdown(
-            """
-**How to take a good photo (important):**
-- Use **bright natural light** (avoid very dark photos).
+    st.markdown("## 📘 User Manual")
+    st.markdown(
+        """
+**How to use this app**
+1. Take a photo or upload a leaf photo.
+2. The model will analyze the image.
+3. It will show a prediction only if confidence ≥ **50%**.
+
+**Tips for best results**
+- Take the photo in **good light** (bright, not too dark).
 - Keep the leaf **in focus** (**no blur**).
-- Capture **one leaf clearly** (fill most of the frame).
-- Use a **plain background** if possible.
-- Avoid strong **shadows**, **reflections**, and **filters**.
-- Don’t crop too tightly — include the **full infected area**.
+- Use a **single leaf** close-up.
+- Avoid busy background (soil, hands, other objects).
+- Use **jpg/png** format.
 
-**How to use the app:**
-1. Click **Take/Upload Photo** and upload a leaf image (**PNG / JPG / JPEG**).
-2. Wait a moment for the prediction.
-3. Read the **predicted class** and **confidence**.
-            """
-        )
+**Common problems**
+- If the image is **blurry** or **too dark**, the app will reject it.
+- If the image is **not a leaf**, the app will reject it.
 
+**Support**
+If you have any issue, contact the app owner.
+"""
+    )
 
 # -----------------------------
 # RIGHT: Title + Upload + Predict
@@ -259,8 +315,8 @@ with right:
     st.markdown(
         """
 <div style="display:flex; align-items:flex-start; gap:0.75rem;">
-  <div style="font-size:2.6rem; line-height:1;"></div>
-  <div style="font-size:2.6rem; font-weight:700; line-height:1.08;">
+  <div style="font-size:2.15rem; line-height:1;"></div>
+  <div style="font-size:2.15rem; font-weight:700; line-height:1.12; max-width: 900px; white-space: normal;">
     Plant Disease identification with AI 🌿
   </div>
 </div>
@@ -268,12 +324,25 @@ with right:
         unsafe_allow_html=True,
     )
 
-    st.caption(
-        "Upload a plant leaf image and this app will identify the plant disease using our trained artificial intelligence model "
-        "(TensorFlow/Keras)."
-    )
-
     st.divider()
+
+    # Optional: quick debug panel (helps when deploying on Streamlit Cloud)
+    with st.expander("Debug (for app owner)", expanded=False):
+        st.write("Python:", f"{__import__('sys').version.split()[0]}")
+        st.write("MODEL_PATH:", str(MODEL_PATH))
+        st.write("MODEL exists:", bool(MODEL_PATH.exists()))
+        if MODEL_PATH.exists():
+            st.write("MODEL size (MB):", round(MODEL_PATH.stat().st_size / (1024**2), 2))
+
+        st.write("CLASSES_PATH:", str(CLASSES_PATH))
+        st.write("CLASSES exists:", bool(CLASSES_PATH.exists()))
+        if CLASSES_PATH.exists():
+            st.write("CLASSES size (KB):", round(CLASSES_PATH.stat().st_size / 1024, 2))
+
+        st.write("Files in app folder:", sorted([p.name for p in BASE_DIR.glob("*")])[:50])
+        models_dir = BASE_DIR / "models"
+        if models_dir.exists():
+            st.write("Files in /models:", sorted([p.name for p in models_dir.glob("*")])[:50])
 
     if model_error:
         st.error("Model is not loaded. Please contact the app owner.")
@@ -285,13 +354,24 @@ with right:
         st.caption(classes_error)
         st.stop()
 
-    uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
+    tab_upload, tab_camera = st.tabs(["📤 Upload", "📷 Camera"])
+
+    with tab_upload:
+        uploaded_file = st.file_uploader("Upload a photo", type=["png", "jpg", "jpeg"], key="uploader")
+
+    with tab_camera:
+        camera_file = st.camera_input("Take a photo", key="camera")
+
+    # Prefer camera capture if provided; otherwise use uploaded file
+    uploaded = camera_file if camera_file is not None else uploaded_file
 
     if uploaded is None:
         st.info(
-            "Upload photos and get the result.\n"
-            "For best results, follow the User Manual on the left.\n"
-            "For any issues, please contact the app owner at .sherzadzabihullah@yahoo.com"
+            """Upload or take a photo and get the result.
+
+For best results, follow the User Manual on the left.
+
+For any issues, please contact the app owner at .sherzadzabihullah@yahoo.com"""
         )
         st.stop()
 
@@ -299,7 +379,17 @@ with right:
     img_hash = hashlib.md5(img_bytes).hexdigest()
 
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    st.image(img, caption=f"Uploaded image (hash: {img_hash[:8]})", use_container_width=True)
+    st.image(img, caption=f"Input image (hash: {img_hash[:8]})", use_container_width=True)
+
+    with st.expander("Show quality checks (brightness / blur / leafness)", expanded=False):
+        q_preview = image_quality_and_leafness(img)
+        st.write("Brightness:", round(float(q_preview["brightness"]), 4))
+        st.write("Blur score (Laplacian variance):", round(float(q_preview["blur_var"]), 2))
+        st.write("Leaf-like pixel ratio:", round(float(q_preview["leaf_ratio"]), 4))
+        st.caption(
+            "Rules: image must be bright enough and not blurry. "
+            "If it doesn't look like a leaf (too little green/yellow-green), it will be rejected."
+        )
 
     if st.button("Reset / Clear image"):
         st.session_state["last_hash"] = None
