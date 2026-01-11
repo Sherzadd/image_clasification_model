@@ -261,7 +261,7 @@ with right:
 <div style="display:flex; align-items:flex-start; gap:0.75rem;">
   <div style="font-size:2.6rem; line-height:1;"></div>
   <div style="font-size:2.6rem; font-weight:700; line-height:1.08;">
-    Plant Disease identification with AI 🌿
+    Plant Disease identification with AI🌿
   </div>
 </div>
 """,
@@ -291,7 +291,7 @@ with right:
         st.info(
             "Upload photos and get the result.\n"
             "For best results, follow the User Manual on the left.\n"
-            "For any issues, please contact the app owner at .sherzadzabihullah@yahoo.com"
+            "For any issues, please contact the app owner"
         )
         st.stop()
 
