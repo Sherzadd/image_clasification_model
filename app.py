@@ -1,109 +1,14 @@
-import json
+from pathlib import Path
+
+updated_code = r'''import json
 import io
 import hashlib
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 import tensorflow as tf
 import streamlit as st
-
-
-# ============================================================
-# ✅ Custom objects needed for your AUGMENTED model to load
-# (fixes: "Cannot deserialize object of type RandomBackgroundReplace_")
-# ============================================================
-
-def background_replace_border_only(x: tf.Tensor) -> tf.Tensor:
-    """
-    x: float32 in [0,1], shape (B,H,W,3)
-    Estimate background color from image borders and replace background with random colors.
-    NOTE: This is TRAINING augmentation. In inference (Streamlit), the layer returns x unchanged.
-    """
-    x = tf.convert_to_tensor(x, dtype=tf.float32)
-
-    B = tf.shape(x)[0]
-    H = tf.shape(x)[1]
-    W = tf.shape(x)[2]
-
-    # collect border pixels: top, bottom, left, right
-    top = x[:, 0, :, :]            # (B, W, 3)
-    bottom = x[:, H - 1, :, :]     # (B, W, 3)
-    left = x[:, :, 0, :]           # (B, H, 3)
-    right = x[:, :, W - 1, :]      # (B, H, 3)
-
-    border = tf.concat(
-        [
-            tf.reshape(top, (B, -1, 3)),
-            tf.reshape(bottom, (B, -1, 3)),
-            tf.reshape(left, (B, -1, 3)),
-            tf.reshape(right, (B, -1, 3)),
-        ],
-        axis=1,
-    )  # (B, N, 3)
-
-    # background color estimate
-    bg = tf.reduce_mean(border, axis=1, keepdims=True)  # (B, 1, 3)
-
-    # distance from bg color
-    dist = tf.norm(x - tf.reshape(bg, (B, 1, 1, 3)), axis=-1)  # (B,H,W)
-
-    # threshold: mean + 2*std of border distances (robust enough for augmentation)
-    border_dist = tf.norm(border - bg, axis=-1)  # (B,N)
-    mu = tf.reduce_mean(border_dist, axis=1, keepdims=True)     # (B,1)
-    sigma = tf.math.reduce_std(border_dist, axis=1, keepdims=True)  # (B,1)
-    thr = mu + 2.0 * sigma  # (B,1)
-
-    thr_img = tf.reshape(thr, (B, 1, 1))
-    leaf_mask = dist > thr_img  # True = foreground
-
-    # random background
-    rand_bg = tf.random.uniform(tf.shape(x), 0.0, 1.0, dtype=tf.float32)
-
-    # keep leaf, replace background
-    out = tf.where(leaf_mask[..., None], x, rand_bg)
-    return out
-
-
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class RandomBackgroundReplace(tf.keras.layers.Layer):
-    """
-    Applies border-based background replacement with probability p DURING TRAINING ONLY.
-    In inference (Streamlit), it returns input unchanged.
-    """
-    def __init__(self, p=0.35, **kwargs):
-        super().__init__(**kwargs)
-        self.p = float(p)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"p": self.p})
-        return cfg
-
-    def call(self, x, training=None):
-        if training is None:
-            training = False
-
-        def train_branch():
-            return tf.cond(
-                tf.random.uniform([]) < self.p,
-                lambda: background_replace_border_only(x),
-                lambda: x,
-            )
-
-        return tf.cond(tf.cast(training, tf.bool), train_branch, lambda: x)
-
-
-# Some saved models end up with a trailing underscore in the class name.
-@tf.keras.utils.register_keras_serializable(package="Custom")
-class RandomBackgroundReplace_(RandomBackgroundReplace):
-    pass
-
-
-CUSTOM_OBJECTS = {
-    "RandomBackgroundReplace": RandomBackgroundReplace,
-    "RandomBackgroundReplace_": RandomBackgroundReplace_,
-}
 
 
 # -----------------------------
@@ -153,8 +58,6 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
-# ✅ Put your augmented model here (Linux compatible .keras)
 MODEL_PATH = (BASE_DIR / "models" / "image_classification_model_linux.keras").resolve()
 CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 
@@ -166,8 +69,21 @@ CONFIDENCE_THRESHOLD = 0.50
 BRIGHTNESS_MIN = 0.12        # too dark -> reject
 BLUR_VAR_MIN = 60.0          # too blurry -> reject
 
-# Masking thresholds (loose: do NOT block predictions)
+# Masking thresholds (loose, because we do NOT want to block predictions)
 KEPT_RATIO_MIN = 0.015       # very small is okay; we mainly want a bbox
+
+# ✅ NEW: "No leaf / unknown" gate
+# If your mask keeps very little, it's probably NOT a leaf photo (documents, faces, objects, etc.)
+MIN_LEAF_RATIO_HARD = 0.15   # below this => almost certainly not a leaf
+MIN_LEAF_RATIO_SOFT = 0.25   # low leaf content (whole plant / clutter)
+MIN_CONFIDENCE_SOFT = 0.85   # if also low confidence => reject
+
+# ✅ NEW: robust whole-plant mode (patch voting)
+PATCH_SIZE = 256
+PATCH_STRIDE = 160
+PATCH_LEAF_RATIO_MIN = 0.12  # per-patch leaf requirement in robust mode
+PATCH_TOP_K = 10
+PATCH_MAX_SIDE = 1024        # resize big photos down for speed
 
 
 # -----------------------------
@@ -183,20 +99,11 @@ def load_class_names(path: Path) -> list[str]:
 
 @st.cache_resource
 def load_model_cached(model_path: str, mtime: float):
-    # Some TF/Keras versions accept safe_mode, others not
+    # Some environments support safe_mode, others not
     try:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False,
-            safe_mode=False,
-        )
+        return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
     except TypeError:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False,
-        )
+        return tf.keras.models.load_model(model_path, compile=False)
 
 
 def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
@@ -266,7 +173,10 @@ def image_quality(img: Image.Image) -> dict:
 # Mask utilities (no OpenCV)
 # -----------------------------
 def _fill_holes(mask: np.ndarray, max_iters: int = 2000) -> np.ndarray:
-    """Fill holes inside a binary mask using flood-fill from image borders on the inverse mask."""
+    """
+    Fill holes inside a binary mask using flood-fill from image borders
+    on the inverse mask.
+    """
     mask = mask.astype(bool)
     inv = ~mask
 
@@ -300,7 +210,7 @@ def _bbox_from_mask(mask: np.ndarray):
     return x0, y0, x1, y1
 
 
-def _pad_bbox(bbox, W, H, pad_frac: float = 0.10):
+def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
     x0, y0, x1, y1 = bbox
     bw = max(1, x1 - x0 + 1)
     bh = max(1, y1 - y0 + 1)
@@ -365,7 +275,7 @@ def mask_by_corners(img: Image.Image, patch: int = 24, percentile: float = 99.5,
 def mask_by_hsv(img: Image.Image):
     """
     Fallback: vegetation-like colors + green-dominance.
-    IMPORTANT: only used to get a bbox; prediction uses original crop.
+    IMPORTANT: this is only used to get a bbox; prediction uses original crop.
     """
     img = img.convert("RGB")
     arr = np.asarray(img, dtype=np.float32) / 255.0
@@ -413,7 +323,7 @@ def mask_by_hsv(img: Image.Image):
 def mask_leaf_for_prediction(img: Image.Image):
     """
     Returns:
-      pred_img    -> ORIGINAL crop (keeps symptoms!)
+      pred_img  -> ORIGINAL crop (keeps symptoms!)
       preview_img -> masked preview (optional UI)
       info
     """
@@ -445,6 +355,86 @@ def mask_leaf_for_prediction(img: Image.Image):
 
     # 3) final fallback: no masking, no block
     return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None}
+
+
+# -----------------------------
+# Robust mode: patch voting (whole plant / clutter)
+# -----------------------------
+def _resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / float(m)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    return img.resize((nw, nh), Image.BILINEAR)
+
+
+def _iter_patches(img: Image.Image, patch: int, stride: int):
+    w, h = img.size
+    if w < patch or h < patch:
+        # If the image is smaller, just yield the image itself
+        yield (0, 0, img)
+        return
+
+    for y in range(0, h - patch + 1, stride):
+        for x in range(0, w - patch + 1, stride):
+            yield (x, y, img.crop((x, y, x + patch, y + patch)))
+
+
+def predict_patch_voting(full_img: Image.Image, model: tf.keras.Model):
+    """
+    Split full image into patches, keep only patches that contain enough leaf pixels,
+    predict per patch, then aggregate (top-k mean).
+    Returns: probs, debug_info
+    """
+    full_img = _resize_max_side(full_img, PATCH_MAX_SIDE)
+
+    patches = []
+    patch_meta = []
+
+    total = 0
+    kept = 0
+
+    for x0, y0, pimg in _iter_patches(full_img, PATCH_SIZE, PATCH_STRIDE):
+        total += 1
+
+        # Use fast mask just to decide if patch contains leaf
+        m1 = mask_by_corners(pimg)
+        info = m1 if (m1 is not None and m1["kept_ratio"] >= KEPT_RATIO_MIN) else mask_by_hsv(pimg)
+        kr = float(info["kept_ratio"]) if info is not None else 0.0
+
+        if kr >= PATCH_LEAF_RATIO_MIN:
+            patches.append(pimg)
+            patch_meta.append((x0, y0, kr))
+            kept += 1
+
+    if kept == 0:
+        return None, {"total_patches": total, "kept_patches": 0}
+
+    # Batch predict for speed
+    batch = np.concatenate([preprocess(p, model) for p in patches], axis=0)
+    preds = model.predict(batch, verbose=0)
+
+    preds = np.asarray(preds)
+    if preds.ndim == 1:
+        preds = preds[None, :]
+
+    probs_all = np.stack([to_probabilities(v) for v in preds], axis=0)  # (N,C)
+
+    # Pick top-k patches by their max confidence
+    conf = probs_all.max(axis=1)
+    k = int(min(PATCH_TOP_K, probs_all.shape[0]))
+    idx = np.argsort(conf)[-k:]
+    probs = probs_all[idx].mean(axis=0)
+
+    dbg = {
+        "total_patches": total,
+        "kept_patches": kept,
+        "top_k_used": k,
+        "avg_leaf_ratio_kept": float(np.mean([m[2] for m in patch_meta])) if patch_meta else 0.0,
+    }
+    return probs, dbg
 
 
 # -----------------------------
@@ -487,12 +477,17 @@ with left:
 **How to take a good photo (important):**
 - Use **bright natural light** (avoid very dark photos).
 - Keep the leaf **in focus** (**no blur**).
-- Capture **one/multiple leaves clearly** (fill most of the frame).
+- Capture **one leaf clearly** (fill most of the frame).
 - A plain background helps, but **is NOT required**.
 
-**How the app works now:**
-- The app tries to **find the plant area** and crops the image.
-- The model predicts on the **original cropped image** (symptoms are preserved).
+**Whole plant photos (recommended):**
+- If you upload the **whole plant**, enable **Robust mode (patch voting)**.
+- The app will scan many patches and focus on leaf/symptom regions.
+
+**How the app works:**
+- The app tries to **find the leaf area** and crops the image.
+- The model predicts on the **original cropped leaf** (symptoms are preserved).
+- If no leaf is detected, the app will ask for a clearer leaf photo.
             """
         )
 
@@ -525,6 +520,8 @@ with right:
         st.caption(classes_error)
         st.stop()
 
+    robust_mode = st.toggle("Robust mode (whole plant / clutter): patch voting", value=False)
+
     uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
 
     if uploaded is None:
@@ -537,47 +534,76 @@ with right:
 
     img_bytes = uploaded.getvalue()
     img_hash = hashlib.md5(img_bytes).hexdigest()
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    # ✅ EXIF-safe loading (phone vs computer consistency)
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(img_bytes))).convert("RGB")
 
     st.image(img, caption=f"Uploaded image (hash: {img_hash[:8]})", use_container_width=True)
 
     if st.button("Reset / Clear image"):
-        for k in ["last_hash", "last_pred", "last_probs"]:
+        for k in ["last_key", "last_pred", "last_probs", "last_debug"]:
             st.session_state.pop(k, None)
         st.rerun()
 
-    # -----------------------------
-    # NEW behavior: find bbox, then predict on ORIGINAL cropped leaf/plant
-    # -----------------------------
-    pred_img, preview_img, mask_info = mask_leaf_for_prediction(img)
-
-    with st.expander("🧪 Show crop / masking preview (used only to locate plant area)", expanded=False):
-        st.image(preview_img, use_container_width=True)
-        st.caption(f"Method: {mask_info['method']} | Kept ratio: {mask_info['kept_ratio']:.2%}")
-        if mask_info["method"] == "none":
-            st.info("Masking wasn’t reliable — using the original image for prediction (no crop).")
-
-    # Quality checks on the image we actually feed to the model
-    q = image_quality(pred_img)
-    if q["brightness"] < BRIGHTNESS_MIN or q["blur_var"] < BLUR_VAR_MIN:
-        st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
+    # Global quality check (fast reject for extremely dark/blurry images)
+    q_global = image_quality(img)
+    if q_global["brightness"] < BRIGHTNESS_MIN * 0.75:
+        st.warning("⚠️ The photo is too dark. Please take a brighter photo of the leaf.")
         st.stop()
 
     # -----------------------------
-    # Predict
+    # Prediction (two modes)
     # -----------------------------
-    x = preprocess(pred_img, model)
+    mode_key = "robust" if robust_mode else "single"
+    cache_key = f"{img_hash}:{mode_key}"
 
-    if st.session_state.get("last_hash") != img_hash or st.session_state.get("last_probs") is None:
-        preds = model.predict(x, verbose=0)
+    if st.session_state.get("last_key") != cache_key or st.session_state.get("last_probs") is None:
+        if robust_mode:
+            probs, dbg = predict_patch_voting(img, model)
 
-        if isinstance(preds, (list, tuple)):
-            preds = preds[0]
-        preds = np.asarray(preds)
-        if preds.ndim == 2:
-            preds = preds[0]
+            if probs is None:
+                st.error("❌ No leaf detected. Please upload a clear leaf photo (close-up).")
+                st.caption("Tip: Make sure the leaf is visible and fills more of the frame.")
+                st.stop()
 
-        probs = to_probabilities(preds)
+            st.session_state["last_debug"] = dbg
+
+        else:
+            # Single-leaf crop mode (fast)
+            pred_img, preview_img, mask_info = mask_leaf_for_prediction(img)
+
+            with st.expander("🧪 Show leaf crop / masking preview (used to locate the leaf)", expanded=False):
+                st.image(preview_img, use_container_width=True)
+                st.caption(f"Method: {mask_info['method']} | Kept ratio: {mask_info['kept_ratio']:.2%}")
+                if mask_info["method"] == "none":
+                    st.info("Masking wasn’t reliable here — using the original image for prediction (no crop).")
+
+            leaf_ratio = float(mask_info.get("kept_ratio", 1.0))
+
+            # ✅ NEW: reject obvious non-leaf images
+            if leaf_ratio < MIN_LEAF_RATIO_HARD:
+                st.error("❌ No leaf detected. Please upload a clear leaf photo (close-up).")
+                st.caption(f"Leaf area detected: {leaf_ratio:.2%} (too low).")
+                st.stop()
+
+            # Quality checks on the image we actually feed to the model
+            q = image_quality(pred_img)
+            if q["brightness"] < BRIGHTNESS_MIN or q["blur_var"] < BLUR_VAR_MIN:
+                st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
+                st.stop()
+
+            x = preprocess(pred_img, model)
+            preds = model.predict(x, verbose=0)
+
+            if isinstance(preds, (list, tuple)):
+                preds = preds[0]
+            preds = np.asarray(preds)
+            if preds.ndim == 2:
+                preds = preds[0]
+
+            probs = to_probabilities(preds)
+            st.session_state["last_debug"] = {"method": mask_info.get("method"), "kept_ratio": leaf_ratio}
+
         pred_id = int(np.argmax(probs))
 
         if pred_id >= len(class_names):
@@ -587,7 +613,7 @@ with right:
             )
             st.stop()
 
-        st.session_state["last_hash"] = img_hash
+        st.session_state["last_key"] = cache_key
         st.session_state["last_probs"] = probs
         st.session_state["last_pred"] = pred_id
 
@@ -595,14 +621,32 @@ with right:
     pred_id = int(st.session_state["last_pred"])
     confidence = float(probs[pred_id])
 
+    # Soft "unknown" gate (helps avoid confident wrong answers on weird inputs)
+    if not robust_mode:
+        dbg = st.session_state.get("last_debug", {})
+        leaf_ratio = float(dbg.get("kept_ratio", 1.0))
+        if leaf_ratio < MIN_LEAF_RATIO_SOFT and confidence < MIN_CONFIDENCE_SOFT:
+            st.warning("⚠️ Leaf is too small/unclear for reliable prediction. Try a closer photo of one leaf.")
+            st.caption(f"Leaf area detected: {leaf_ratio:.2%} | Confidence: {confidence:.2%}")
+            st.stop()
+
     if confidence < CONFIDENCE_THRESHOLD:
-        st.warning("⚠️ The confidence is low. Try a brighter/sharper photo and try again.")
+        st.warning("⚠️ Low confidence. Please upload a clearer leaf photo and try again.")
         st.stop()
 
     pred_label = class_names[pred_id]
 
     st.success(f"✅ Predicted class: **{pred_label}**")
     st.write(f"Confidence: **{confidence:.2%}**")
+
+    # Debug info for robust mode
+    if robust_mode:
+        dbg = st.session_state.get("last_debug", {})
+        with st.expander("🧩 Robust mode details (patch voting)", expanded=False):
+            st.write(f"Total patches scanned: {dbg.get('total_patches', '-')}")
+            st.write(f"Patches used (leafy): {dbg.get('kept_patches', '-')}")
+            st.write(f"Top‑K patches averaged: {dbg.get('top_k_used', '-')}")
+            st.write(f"Avg leaf ratio (kept patches): {dbg.get('avg_leaf_ratio_kept', 0.0):.2%}")
 
     st.subheader("3) Top predictions (≥ 50%)")
     idx_over = np.where(np.asarray(probs) >= CONFIDENCE_THRESHOLD)[0]
@@ -611,4 +655,10 @@ with right:
     for rank, i in enumerate(idx_over, start=1):
         st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
 
-    st.caption("Tip: If predictions look wrong, try a brighter/sharper photo.")
+    st.caption("Tip: If predictions look wrong, try a brighter/sharper close-up photo of a single leaf.")
+'''
+# Write updated file
+out_path = Path("/mnt/data/app_updated.py")
+out_path.write_text(updated_code, encoding="utf-8")
+str(out_path)
+
