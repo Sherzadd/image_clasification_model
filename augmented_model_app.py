@@ -155,8 +155,8 @@ div[data-testid="stFileUploader"] button::after {
 BASE_DIR = Path(__file__).resolve().parent
 
 # ✅ Put your augmented model here (Linux compatible .keras)
-MODEL_PATH = (BASE_DIR / "models" / "image_classification_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
+MODEL_PATH = (BASE_DIR / "models" / "augmented_model_linux.keras").resolve()
+CLASSES_PATH = (BASE_DIR / "classes.json").resolve()
 
 # -----------------------------
 # Rules / thresholds
@@ -177,7 +177,7 @@ def load_class_names(path: Path) -> list[str]:
     with open(path, "r", encoding="utf-8") as f:
         names = json.load(f)
     if not isinstance(names, list) or not names:
-        raise ValueError("class_names.json must be a non-empty JSON list.")
+        raise ValueError("classes.json must be a non-empty JSON list.")
     return names
 
 
