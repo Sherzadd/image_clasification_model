@@ -52,11 +52,6 @@ div[data-testid="stFileUploaderDropzone"] {
 )
 
 
-<<<<<<< HEAD:augmented_model_app.py
-# ✅ Put your augmented model here (Linux compatible .keras)
-MODEL_PATH = (BASE_DIR / "models" / "augmented_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "classes.json").resolve()
-=======
 # ============================================================
 # Background removal (HSV) — FIXED to keep bright/glare areas
 # ============================================================
@@ -65,7 +60,6 @@ def _fill_holes(fg_mask: np.ndarray) -> np.ndarray:
     fg = fg_mask.astype(bool)
     h, w = fg.shape
     bg = ~fg
->>>>>>> parent of a1ec998d (restore):app.py
 
     visited = np.zeros((h, w), dtype=bool)
     q = deque()
@@ -99,53 +93,6 @@ def _fill_holes(fg_mask: np.ndarray) -> np.ndarray:
     return fg | holes
 
 
-<<<<<<< HEAD:augmented_model_app.py
-# -----------------------------
-# Helpers: loading
-# -----------------------------
-def load_class_names(path: Path) -> list[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        names = json.load(f)
-    if not isinstance(names, list) or not names:
-        raise ValueError("classes.json must be a non-empty JSON list.")
-    return names
-
-
-@st.cache_resource
-def load_model_cached(model_path: str, mtime: float):
-    # Some TF/Keras versions accept safe_mode, others not
-    try:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False,
-            safe_mode=False,
-        )
-    except TypeError:
-        return tf.keras.models.load_model(
-            model_path,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False,
-        )
-
-
-def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
-    def _has(layer) -> bool:
-        if layer.__class__.__name__.lower() == "rescaling":
-            return True
-        if hasattr(layer, "layers"):
-            for sub in layer.layers:
-                if _has(sub):
-                    return True
-        return False
-    return _has(model)
-
-
-# -----------------------------
-# Helpers: preprocessing / postprocessing
-# -----------------------------
-def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
-=======
 def remove_bg_hsv_keep_bright(
     img: Image.Image,
     *,
@@ -155,7 +102,6 @@ def remove_bg_hsv_keep_bright(
     v_min=25,   # ✅ allow bright pixels (no V max!)
     max_dim=900
 ):
->>>>>>> parent of a1ec998d (restore):app.py
     """
     HSV leaf mask that does NOT remove bright glare areas.
     Returns: rgba_image, kept_ratio (0..1)
