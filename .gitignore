@@ -145,6 +145,11 @@ models/*
 # Data (never commit raw images)
 data/raw/
 PlantVillage/
+data/wild_test/
+data/wild_pool/
+data/splits/
+reports/
+data/
 
 # Large files
 *.zip
