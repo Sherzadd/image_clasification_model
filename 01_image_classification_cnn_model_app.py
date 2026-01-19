@@ -2,9 +2,8 @@ import json
 import io
 import hashlib
 from pathlib import Path
-
-import numpy as np
 import cv2
+import numpy as np
 from PIL import Image, ImageFilter
 import tensorflow as tf
 import streamlit as st
@@ -57,10 +56,8 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = (BASE_DIR / "01_tomato_disease_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "tomato_class_names.json").resolve()
-
+MODEL_PATH = (BASE_DIR / "models" / "01_image_classification_cnn_model_linux.keras").resolve()
+CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 
 # -----------------------------
 # Rules / thresholds
@@ -432,8 +429,6 @@ def mask_leaf_for_prediction(img: Image.Image):
 
     # 3) final fallback: no masking, no block
     return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None, "mask_crop_255": None}
-
-
 # -----------------------------
 # Load model + class names (hidden)
 # -----------------------------
@@ -545,7 +540,7 @@ with right:
             st.info("Masking wasn’t reliable here — using the original image for prediction (no crop).")
 
     # Quality checks on the image we actually feed to the model
-    q = image_quality(pred_img, mask_info.get("mask_crop_255"))
+    q = image_quality(pred_img)
     if q["brightness"] < BRIGHTNESS_MIN or q["blur_var"] < BLUR_VAR_MIN:
         st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
         st.stop()
