@@ -2,7 +2,7 @@ import json
 import io
 import hashlib
 from pathlib import Path
-
+import cv2
 import numpy as np
 from PIL import Image, ImageFilter
 import tensorflow as tf
@@ -78,7 +78,7 @@ def load_class_names(path: Path) -> list[str]:
     with open(path, "r", encoding="utf-8") as f:
         names = json.load(f)
     if not isinstance(names, list) or not names:
-        raise ValueError("classes.json must be a non-empty JSON list.")
+        raise ValueError("class_names.json must be a non-empty JSON list.")
     return names
 
 
@@ -138,61 +138,225 @@ def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
     return pred_vector
 
 
-def image_quality(img: Image.Image) -> dict:
-    """Brightness + blur (Laplacian variance)."""
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32)
-    brightness = float(arr.mean() / 255.0)
+def image_quality(img: Image.Image, mask_255: np.ndarray | None = None) -> dict:
+    """Brightness + blur (Laplacian variance). If a mask is provided, compute metrics on masked pixels only."""
+    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    gray = arr.mean(axis=2)
-    up = np.roll(gray, -1, axis=0)
-    down = np.roll(gray, 1, axis=0)
-    left = np.roll(gray, -1, axis=1)
-    right = np.roll(gray, 1, axis=1)
-    lap = (up + down + left + right) - 4.0 * gray
+    if mask_255 is not None and getattr(mask_255, "size", 0) and bool(np.any(mask_255 > 0)):
+        m = (mask_255 > 0).astype(np.float32)
+        denom = float(m.sum())
+        if denom >= 10:
+            brightness = float((gray * m).sum() / denom / 255.0)
+            lap = cv2.Laplacian(gray, cv2.CV_32F)
+            blur_var = float(lap[m > 0].var())
+            return {"brightness": brightness, "blur_var": blur_var}
+
+    # Fallback: whole image
+    brightness = float(gray.mean() / 255.0)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
     blur_var = float(lap.var())
-
     return {"brightness": brightness, "blur_var": blur_var}
 
 
-# -----------------------------
-# Mask utilities (no OpenCV)
-# -----------------------------
-def _fill_holes(mask: np.ndarray, max_iters: int = 2000) -> np.ndarray:
-    """
-    Fill holes inside a binary mask using flood-fill from image borders
-    on the inverse mask.
-    """
-    mask = mask.astype(bool)
-    inv = ~mask
+ # -----------------------------
+ # Mask utilities (OpenCV)
+ # -----------------------------
+def _refine_mask(mask_255: np.ndarray) -> np.ndarray:
+    """Morphology cleanup + fill internal holes + keep up to 3 largest components."""
+    m = (mask_255 > 0).astype(np.uint8) * 255
 
-    reach = np.zeros_like(inv, dtype=bool)
-    reach[0, :] = inv[0, :]
-    reach[-1, :] = inv[-1, :]
-    reach[:, 0] = inv[:, 0]
-    reach[:, -1] = inv[:, -1]
+    # Smooth edges / remove small noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=2)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    for _ in range(max_iters):
-        nb = (
-            np.roll(reach, 1, 0) | np.roll(reach, -1, 0) |
-            np.roll(reach, 1, 1) | np.roll(reach, -1, 1)
-        )
-        new = reach | (nb & inv)
-        if new.sum() == reach.sum():
-            reach = new
+    # Fill holes so dark/yellow/brown symptoms inside the leaf are NOT removed from the mask
+    # (important for previews and any mask-based metrics)
+    h, w = m.shape[:2]
+    seed = None
+    for sx, sy in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+        if m[sy, sx] == 0:
+            seed = (sx, sy)
             break
-        reach = new
 
-    holes = inv & ~reach
-    return mask | holes
+    if seed is not None:
+        flood = m.copy()
+        ffmask = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(flood, ffmask, seedPoint=seed, newVal=255)
+        holes = cv2.bitwise_not(flood)
+        m = cv2.bitwise_or(m, holes)
+
+    # Keep up to 3 biggest foreground components
+    m_bin = (m > 0).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m_bin, connectivity=8)
+    if num <= 1:
+        return (m_bin * 255).astype(np.uint8)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx_sorted = np.argsort(areas)[::-1]
+    keep = np.zeros_like(m_bin)
+    for k in idx_sorted[:3]:
+        keep[labels == (k + 1)] = 1
+
+    return (keep * 255).astype(np.uint8)
 
 
-def _bbox_from_mask(mask: np.ndarray):
-    ys, xs = np.where(mask)
-    if len(xs) == 0 or len(ys) == 0:
+def _segment_grabcut(np_rgb: np.ndarray, iters: int = 5) -> np.ndarray:
+    """GrabCut foreground mask (0/255) initialized with a center rectangle."""
+    bgr = cv2.cvtColor(np_rgb, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+
+    mask = np.zeros((h, w), np.uint8)
+    pad_w = int(0.08 * w)
+    pad_h = int(0.08 * h)
+    rect = (pad_w, pad_h, w - 2 * pad_w, h - 2 * pad_h)
+
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+
+    cv2.grabCut(bgr, mask, rect, bgdModel, fgdModel, iters, cv2.GC_INIT_WITH_RECT)
+    fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    return _refine_mask((fg * 255).astype(np.uint8))
+
+
+def _segment_hsv_green(np_rgb: np.ndarray) -> np.ndarray:
+    """HSV green-ish threshold mask (0/255)."""
+    hsv = cv2.cvtColor(np_rgb, cv2.COLOR_RGB2HSV)
+    lower = np.array([25, 25, 25], dtype=np.uint8)
+    upper = np.array([95, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
+    return _refine_mask(mask)
+
+
+def _score_mask(mask_255: np.ndarray) -> float:
+    """Heuristic score to auto-pick a leaf-like mask."""
+    h, w = mask_255.shape[:2]
+    img_area = float(h * w)
+    cov = float((mask_255 > 0).mean())
+    if cov < 0.03 or cov > 0.90:
+        return -1.0
+
+    cnts, _ = cv2.findContours(mask_255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return -1.0
+
+    areas = np.array([cv2.contourArea(c) for c in cnts], dtype=np.float32)
+    largest = float(areas.max())
+    largest_ratio = largest / img_area
+    frag_penalty = float(len(cnts)) * 0.02
+    return (0.6 * cov + 1.2 * largest_ratio) - frag_penalty
+
+
+def _auto_leaf_mask(np_rgb: np.ndarray) -> tuple[np.ndarray, str]:
+    """Try GrabCut + HSV and pick the best."""
+    candidates = []
+    try:
+        m1 = _segment_grabcut(np_rgb, iters=5)
+        candidates.append((m1, "grabcut"))
+    except Exception:
+        pass
+
+    try:
+        m2 = _segment_hsv_green(np_rgb)
+        candidates.append((m2, "hsv"))
+    except Exception:
+        pass
+
+    if not candidates:
+        h, w = np_rgb.shape[:2]
+        return np.zeros((h, w), dtype=np.uint8), "none"
+
+    best_mask, best_name = max(candidates, key=lambda t: _score_mask(t[0]))
+    return best_mask, best_name
+
+
+def _bbox_from_mask_255(mask_255: np.ndarray, np_rgb: np.ndarray | None = None):
+    """
+    Choose a *best* component bbox, not simply the largest.
+
+    Why: In real photos, the largest green region can be background leaves or even fruit.
+    We score candidates using:
+      - closeness to image center (users usually center the target leaf)
+      - focus/sharpness (foreground leaf tends to be sharper than background)
+      - leaf-like shape (less circular than fruit)
+      - reasonable area
+    """
+    cnts, _ = cv2.findContours(mask_255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
         return None
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    return x0, y0, x1, y1
+
+    h, w = mask_255.shape[:2]
+    img_area = float(h * w)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+
+    # Precompute focus map if image is provided
+    gray = None
+    if np_rgb is not None and np_rgb.ndim == 3:
+        try:
+            gray = cv2.cvtColor(np_rgb, cv2.COLOR_RGB2GRAY)
+        except Exception:
+            gray = None
+
+    best_bbox = None
+    best_score = -1e9
+
+    for c in cnts:
+        area = float(cv2.contourArea(c))
+        if area <= 0:
+            continue
+
+        # Ignore extremely tiny components
+        if (area / img_area) < 0.005:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(c)
+        x1 = x + bw - 1
+        y1 = y + bh - 1
+
+        # Distance to image center (normalized)
+        bx, by = x + bw / 2.0, y + bh / 2.0
+        dist = float(np.hypot((bx - cx) / w, (by - cy) / h))
+
+        # Shape: circularity (fruit ~1, leaves usually lower)
+        perim = float(cv2.arcLength(c, True))
+        circularity = (4.0 * np.pi * area) / (perim * perim + 1e-6)
+        circularity = float(np.clip(circularity, 0.0, 1.2))
+
+        # Focus (foreground tends to be sharper); normalize to ~[0,1.5]
+        focus_norm = 0.0
+        if gray is not None:
+            roi = gray[max(0, y):min(h, y1 + 1), max(0, x):min(w, x1 + 1)]
+            if roi.size >= 400:  # avoid unstable tiny ROIs
+                fv = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+                focus_norm = float(np.clip(fv / 120.0, 0.0, 1.5))
+
+        # Border penalty (background regions often touch borders)
+        touches_border = (x <= 1) or (y <= 1) or (x1 >= w - 2) or (y1 >= h - 2)
+        border_penalty = 0.35 if touches_border else 0.0
+
+        area_ratio = area / img_area
+
+        # Candidate score (tuned for "choose the centered, sharp leaf")
+        score = (
+            0.80 * area_ratio
+            - 1.60 * dist
+            + 0.70 * focus_norm
+            + 0.35 * (1.0 - min(circularity, 1.0))
+            - border_penalty
+        )
+
+        if score > best_score:
+            best_score = score
+            best_bbox = (int(x), int(y), int(x1), int(y1))
+
+    # Fallback: if scoring filtered everything, use largest area
+    if best_bbox is None:
+        c = max(cnts, key=cv2.contourArea)
+        x, y, bw, bh = cv2.boundingRect(c)
+        best_bbox = (int(x), int(y), int(x + bw - 1), int(y + bh - 1))
+
+    return best_bbox
 
 
 def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
@@ -208,101 +372,25 @@ def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
     return x0, y0, x1, y1
 
 
-def _apply_white_bg(img: Image.Image, mask: np.ndarray) -> Image.Image:
-    """Preview-only: show masked image with white background."""
-    mask_img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
-    white = Image.new("RGB", img.size, (255, 255, 255))
-    return Image.composite(img, white, mask_img)
-
-
-# -----------------------------
-# Mask methods
-# -----------------------------
-def mask_by_corners(img: Image.Image, patch: int = 24, percentile: float = 99.5, extra_margin: float = 0.05):
+def _overlay_mask_on_crop(crop_img: Image.Image, mask_crop_255: np.ndarray) -> Image.Image:
     """
-    Estimate background color from 4 corners, keep pixels far from it.
-    Good when corners are true background.
+    Preview-only: draw mask OUTLINE on the ORIGINAL crop.
+
+    Important: Do NOT fill/tint the whole leaf region, otherwise disease spots can look
+    "greener" or visually muted. Outlines preserve the original colors and symptoms.
     """
-    img = img.convert("RGB")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    H, W, _ = arr.shape
+    arr = np.asarray(crop_img.convert("RGB"), dtype=np.uint8)
+    if mask_crop_255 is None or not bool(np.any(mask_crop_255 > 0)):
+        return crop_img
 
-    p = int(min(patch, H // 3, W // 3))
-    if p < 4:
-        return None
+    cnts, _ = cv2.findContours(mask_crop_255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return crop_img
 
-    corners = np.concatenate([
-        arr[:p, :p, :].reshape(-1, 3),
-        arr[:p, W - p:, :].reshape(-1, 3),
-        arr[H - p:, :p, :].reshape(-1, 3),
-        arr[H - p:, W - p:, :].reshape(-1, 3),
-    ], axis=0)
-
-    bg = np.median(corners, axis=0)
-    dist = np.linalg.norm(arr - bg[None, None, :], axis=2)
-
-    corner_dist = np.linalg.norm(corners - bg[None, :], axis=1)
-    thr = float(np.percentile(corner_dist, percentile) + extra_margin)
-
-    raw = dist > thr
-
-    m = Image.fromarray((raw.astype(np.uint8) * 255), mode="L")
-    m = m.filter(ImageFilter.MedianFilter(size=5))
-    m = m.filter(ImageFilter.GaussianBlur(radius=1.0))
-    mask = (np.array(m) > 40)
-
-    mask = _fill_holes(mask)
-    kept_ratio = float(mask.mean())
-
-    return {"mask": mask, "kept_ratio": kept_ratio, "method": "corners"}
-
-
-def mask_by_hsv(img: Image.Image):
-    """
-    Fallback: vegetation-like colors + green-dominance.
-    IMPORTANT: this is only used to get a bbox; prediction uses original crop.
-    """
-    img = img.convert("RGB")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-
-    maxc = np.maximum(np.maximum(r, g), b)
-    minc = np.minimum(np.minimum(r, g), b)
-    delta = maxc - minc
-
-    h = np.zeros_like(maxc)
-    m = delta > 1e-6
-
-    idx = m & (maxc == r)
-    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
-    idx = m & (maxc == g)
-    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
-    idx = m & (maxc == b)
-    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
-    h = (h / 6.0) % 1.0
-
-    s = np.zeros_like(maxc)
-    idx2 = maxc > 1e-6
-    s[idx2] = delta[idx2] / maxc[idx2]
-    v = maxc
-
-    # relaxed vegetation-ish thresholds
-    hsv_leaf = (h >= 0.08) & (h <= 0.58) & (s >= 0.10) & (v >= 0.10)
-
-    # also accept "green dominance" pixels
-    green_dom = (g > r * 1.02) & (g > b * 1.02) & (v >= 0.08)
-
-    raw = hsv_leaf | green_dom
-
-    m_img = Image.fromarray((raw.astype(np.uint8) * 255), mode="L")
-    m_img = m_img.filter(ImageFilter.MedianFilter(size=5))
-    m_img = m_img.filter(ImageFilter.GaussianBlur(radius=1.0))
-    mask = (np.array(m_img) > 40)
-
-    mask = _fill_holes(mask)
-    kept_ratio = float(mask.mean())
-
-    return {"mask": mask, "kept_ratio": kept_ratio, "method": "hsv"}
+    out = arr.copy()
+    # Drawing on RGB works fine because (0,255,0) is green in both RGB and BGR.
+    cv2.drawContours(out, cnts, -1, (0, 255, 0), thickness=3)
+    return Image.fromarray(out)
 
 
 def mask_leaf_for_prediction(img: Image.Image):
@@ -314,34 +402,33 @@ def mask_leaf_for_prediction(img: Image.Image):
     """
     W, H = img.size
 
-    # 1) corners
-    out = mask_by_corners(img)
-    if out is not None and out["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out["mask"])
-        if bbox is not None:
-            bbox = _pad_bbox(bbox, W, H)
-            x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out["bbox"] = bbox
-            return pred_img, preview, out
+    np_rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
 
-    # 2) hsv fallback
-    out2 = mask_by_hsv(img)
-    if out2 is not None and out2["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out2["mask"])
+    # Auto-pick best mask between GrabCut and HSV
+    mask_255, method = _auto_leaf_mask(np_rgb)
+    kept_ratio = float((mask_255 > 0).mean())
+
+    if kept_ratio >= KEPT_RATIO_MIN:
+        # Use the image itself to help select the most relevant component (sharp + centered)
+        bbox = _bbox_from_mask_255(mask_255, np_rgb=np_rgb)
         if bbox is not None:
             bbox = _pad_bbox(bbox, W, H)
             x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out2["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out2["bbox"] = bbox
-            return pred_img, preview, out2
+
+            # ORIGINAL crop used for prediction ✅ (symptoms preserved)
+            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))
+
+            # Mask crop for quality metrics + preview overlay
+            mask_crop_255 = mask_255[y0:y1 + 1, x0:x1 + 1]
+
+            # Preview: overlay mask on the ORIGINAL crop (no symptom removal)
+            preview = _overlay_mask_on_crop(pred_img, mask_crop_255)
+
+            info = {"kept_ratio": kept_ratio, "method": method, "bbox": bbox, "mask_crop_255": mask_crop_255}
+            return pred_img, preview, info
 
     # 3) final fallback: no masking, no block
-    return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None}
-
-
+    return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None, "mask_crop_255": None}
 # -----------------------------
 # Load model + class names (hidden)
 # -----------------------------
