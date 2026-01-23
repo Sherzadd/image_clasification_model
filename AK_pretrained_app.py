@@ -59,7 +59,7 @@ div[data-testid="stFileUploader"] button::after {
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = (BASE_DIR / "models" / "v3-1_best_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "tomato_class_names.json").resolve()
+CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 
 
 # -----------------------------
